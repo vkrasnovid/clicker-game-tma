@@ -507,6 +507,9 @@ function loadState() {
     state.crystals           = Math.max(0, Number(state.crystals)           || 0);
     state.prestigeMultiplier = Math.max(1, Number(state.prestigeMultiplier) || 1);
     state.goldRushEndTime    = Math.max(0, Number(state.goldRushEndTime)    || 0);
+    // [FIX:SEC-1] clamp lastSave to [0, now] — future timestamps cause negative offline earnings
+    state.lastSave           = Math.min(Date.now(), Math.max(0, Number(state.lastSave)           || 0));
+    console.debug('[FIX:SEC-1] lastSave clamped to %d', state.lastSave);
     console.debug('[LOAD] loaded state', state);
   } catch(e) {
     console.warn('[LOAD] failed, using defaults:', e);
@@ -807,7 +810,7 @@ function startAutoClicker() {
 // ===== Offline Earnings =====
 function calcOfflineEarnings() {
   if (!state.lastSave || state.perSecond <= 0) return 0;
-  const elapsed = Math.min(Date.now() - state.lastSave, 2 * 3600 * 1000);
+  const elapsed = Math.max(0, Math.min(Date.now() - state.lastSave, 2 * 3600 * 1000)); // [FIX:SEC-1] guard against future lastSave
   const coins = Math.floor(state.perSecond * (elapsed / 1000) * state.prestigeMultiplier);
   console.log('[OFFLINE] elapsed=%ds earned=%f', (elapsed / 1000).toFixed(0), coins);
   return coins;
@@ -845,6 +848,7 @@ function renderShop() {
 
     const card = document.createElement('div');
     card.className = 'shop-card' + (canBuy ? '' : ' disabled') + (isRushActive ? ' rush-active' : '');
+    card.dataset.id = upg.id; // [FIX:CQ-1] used by delegated listener on #shop-panel
     card.innerHTML = `
       <div class="card-icon">${upg.icon}</div>
       <div class="card-body">
@@ -855,11 +859,7 @@ function renderShop() {
         <span class="card-level">Ур. ${level}</span>
         <span class="card-cost ${canBuy ? '' : 'cannot-afford'}">🪙 ${formatNumber(cost)}</span>
       </div>`;
-
-    if (canBuy) {
-      card.addEventListener('click', () => buyUpgrade(upg.id));
-      card.addEventListener('touchend', (e) => { e.preventDefault(); buyUpgrade(upg.id); });
-    }
+    // [FIX:CQ-1] no per-card listeners — handled by delegated listener on #shop-panel
     panel.appendChild(card);
   });
 }
@@ -897,13 +897,11 @@ function updateUI() {
     if (!upg) return;
     const cost = getUpgradeCost(upg.id);
     const canBuy = state.coins >= cost;
+    // [FIX:CQ-1] toggle disabled class only — no DOM rebuild, no per-tick listener accumulation
     if (canBuy && card.classList.contains('disabled')) {
       card.classList.remove('disabled');
-      card.addEventListener('click', () => buyUpgrade(upg.id));
-      // [FIX:H-1] add touchend so newly-affordable cards respond immediately on mobile
-      card.addEventListener('touchend', (e) => { e.preventDefault(); buyUpgrade(upg.id); });
     } else if (!canBuy && !card.classList.contains('disabled')) {
-      renderShop();
+      card.classList.add('disabled');
     }
     card.querySelector('.card-cost').className = 'card-cost' + (canBuy ? '' : ' cannot-afford');
   });
@@ -925,9 +923,8 @@ function shareScore() {
   // [FIX:M-3] switchInlineQuery requires inline-bot registration; use openTelegramLink instead
   if (tg?.openTelegramLink) {
     tg.openTelegramLink('https://t.me/share/url?url=https%3A%2F%2Ft.me%2F&text=' + encodeURIComponent(msg));
-  } else if (tg?.sendData) {
-    tg.sendData(msg);
   } else {
+    // [FIX:TG-1] removed tg.sendData() — it closes the Mini App mid-session; use non-destructive fallback
     // Browser fallback
     if (navigator.share) {
       navigator.share({ text: msg }).catch(() => {});
@@ -971,6 +968,18 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   renderShop();
+
+  // [FIX:CQ-1] single delegated listener on #shop-panel instead of per-card per-tick listeners
+  const shopPanel = document.getElementById('shop-panel');
+  shopPanel.addEventListener('click', (e) => {
+    const card = e.target.closest('.shop-card:not(.disabled)');
+    if (card) { console.debug('[FIX:CQ-1] buy via delegation, id=%s', card.dataset.id); buyUpgrade(card.dataset.id); }
+  });
+  shopPanel.addEventListener('touchend', (e) => {
+    const card = e.target.closest('.shop-card:not(.disabled)');
+    if (card) { e.preventDefault(); buyUpgrade(card.dataset.id); }
+  });
+
   updateUI();
   startAutoClicker();
 });
