@@ -473,6 +473,8 @@ let goldRushEndTime = 0;
 function saveState() {
   try {
     state.lastSave = Date.now();
+    // [FIX:M-4] persist goldRushEndTime so an active Gold Rush survives reload
+    state.goldRushEndTime = goldRushEndTime;
     localStorage.setItem('clicker_save', JSON.stringify(state));
     console.debug('[SAVE] saved at', Date.now());
   } catch(e) {
@@ -495,6 +497,16 @@ function loadState() {
     state.upgrades = { ...def.upgrades, ...saved.upgrades };
     // sessionStart is always fresh
     state.sessionStart = Date.now();
+    // [FIX:M-6] clamp numeric fields so a corrupted save cannot propagate NaN/null through state
+    state.coins              = Math.max(0, Number(state.coins)              || 0);
+    state.totalCoins         = Math.max(0, Number(state.totalCoins)         || 0);
+    state.totalTaps          = Math.max(0, Number(state.totalTaps)          || 0);
+    state.tapPower           = Math.max(1, Number(state.tapPower)           || 1);
+    state.perSecond          = Math.max(0, Number(state.perSecond)          || 0);
+    state.critChance         = Math.max(0, Number(state.critChance)         || 0);
+    state.crystals           = Math.max(0, Number(state.crystals)           || 0);
+    state.prestigeMultiplier = Math.max(1, Number(state.prestigeMultiplier) || 1);
+    state.goldRushEndTime    = Math.max(0, Number(state.goldRushEndTime)    || 0);
     console.debug('[LOAD] loaded state', state);
   } catch(e) {
     console.warn('[LOAD] failed, using defaults:', e);
@@ -509,7 +521,10 @@ function resetState() {
   state.crystals = crystals;
   state.prestigeMultiplier = prestigeMultiplier;
   state.sessionStart = Date.now();
+  // [FIX:H-3] reset tapCount so Mega Tap cadence starts fresh after prestige
+  tapCount = 0;
   goldRushActive = false;
+  goldRushEndTime = 0;
   if (goldRushTimer) { clearTimeout(goldRushTimer); goldRushTimer = null; }
   console.debug('[RESET] state reset, kept crystals=%d multiplier=%f', crystals, prestigeMultiplier);
 }
@@ -601,19 +616,21 @@ function buyUpgrade(id) {
   saveState();
 }
 
-function activateGoldRush() {
+// [FIX:M-4] accept optional duration so we can restore a partial Gold Rush after reload
+function activateGoldRush(duration = 10000) {
   if (goldRushTimer) clearTimeout(goldRushTimer);
   goldRushActive = true;
-  goldRushEndTime = Date.now() + 10000;
-  console.log('[GOLDRUSH] activated, ends at', goldRushEndTime);
+  goldRushEndTime = Date.now() + duration;
+  console.log('[GOLDRUSH] activated, ends at', goldRushEndTime, 'duration=%d', duration);
   renderShop();
   goldRushTimer = setTimeout(() => {
     goldRushActive = false;
     goldRushTimer = null;
+    goldRushEndTime = 0;
     console.log('[GOLDRUSH] expired');
     renderShop();
     updateUI();
-  }, 10000);
+  }, duration);
 }
 
 // ===== Stage System =====
@@ -702,11 +719,12 @@ function handleTap(e) {
   let gain = state.tapPower * state.prestigeMultiplier;
   let floatClass = '';
 
-  // Mega tap: every 50th
+  // Mega tap: every 50th — [FIX:M-2] scale by megaTap upgrade level so higher levels matter
   if (tapCount % 50 === 0) {
-    gain *= 100;
+    const megaEffect = Math.max(1, getUpgradeEffect('megaTap'));
+    gain *= 100 * megaEffect;
     floatClass = 'mega';
-    console.debug('[TAP] mega tap!');
+    console.debug('[TAP] mega tap! megaEffect=%d', megaEffect);
   }
   // Critical tap (only if not mega)
   else if (state.critChance > 0 && Math.random() * 100 < state.critChance) {
@@ -777,10 +795,11 @@ function spawnParticles(x, y, count) {
 function startAutoClicker() {
   setInterval(() => {
     if (state.perSecond <= 0) return;
-    const gain = state.perSecond * state.prestigeMultiplier * (goldRushActive ? 5 : 1);
+    // [FIX:H-2] floor gain to prevent float accumulation causing display lag
+    const gain = Math.floor(state.perSecond * state.prestigeMultiplier * (goldRushActive ? 5 : 1));
     state.coins += gain;
     state.totalCoins += gain;
-    console.debug('[AUTO] tick gain=%f perSec=%f', gain, state.perSecond);
+    console.debug('[AUTO] tick gain=%d perSec=%f', gain, state.perSecond);
     updateUI();
   }, 1000);
 }
@@ -809,9 +828,15 @@ function renderShop() {
     const canBuy = state.coins >= cost;
     const effect = getUpgradeEffect(upg.id);
 
-    let descText = upg.desc.replace('%v', upg.id === 'multiplier'
-      ? 'x' + (1 + 0.5 * level).toFixed(1)
-      : (upg.id === 'critTap' ? Math.min(level * 5, 80) + '%' : effect));
+    // [FIX:M-5] at level 0 multiplier shows "×1.0" (no effect); show post-purchase preview instead
+    let descText;
+    if (upg.id === 'multiplier' && level === 0) {
+      descText = '×1.5 после покупки';
+    } else {
+      descText = upg.desc.replace('%v', upg.id === 'multiplier'
+        ? 'x' + (1 + 0.5 * level).toFixed(1)
+        : (upg.id === 'critTap' ? Math.min(level * 5, 80) + '%' : effect));
+    }
 
     const isRushActive = upg.id === 'goldRush' && goldRushActive;
     const rushSuffix = isRushActive
@@ -875,6 +900,8 @@ function updateUI() {
     if (canBuy && card.classList.contains('disabled')) {
       card.classList.remove('disabled');
       card.addEventListener('click', () => buyUpgrade(upg.id));
+      // [FIX:H-1] add touchend so newly-affordable cards respond immediately on mobile
+      card.addEventListener('touchend', (e) => { e.preventDefault(); buyUpgrade(upg.id); });
     } else if (!canBuy && !card.classList.contains('disabled')) {
       renderShop();
     }
@@ -895,8 +922,9 @@ setInterval(() => {
 // ===== Share =====
 function shareScore() {
   const msg = `Я набрал ${formatNumber(state.totalCoins)} монет в Кликере! 🎮`;
-  if (tg?.switchInlineQuery) {
-    tg.switchInlineQuery(msg, ['users', 'groups']);
+  // [FIX:M-3] switchInlineQuery requires inline-bot registration; use openTelegramLink instead
+  if (tg?.openTelegramLink) {
+    tg.openTelegramLink('https://t.me/share/url?url=https%3A%2F%2Ft.me%2F&text=' + encodeURIComponent(msg));
   } else if (tg?.sendData) {
     tg.sendData(msg);
   } else {
@@ -912,9 +940,11 @@ function shareScore() {
 }
 
 // ===== Touch events on coin =====
+// [FIX:M-1] guard click against synthetic post-touchstart fire on older Android webviews
+let _lastTouchTime = 0;
 const coinEl = document.getElementById('coin');
-coinEl.addEventListener('touchstart', handleTap, { passive: false });
-coinEl.addEventListener('click', handleTap);
+coinEl.addEventListener('touchstart', (e) => { _lastTouchTime = Date.now(); handleTap(e); }, { passive: false });
+coinEl.addEventListener('click', (e) => { if (Date.now() - _lastTouchTime > 350) handleTap(e); });
 
 // ===== Init =====
 document.addEventListener('DOMContentLoaded', () => {
@@ -922,6 +952,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   loadState();
   recalcStats();
+
+  // [FIX:M-4] restore Gold Rush if it was still active when the page was last saved
+  if (state.goldRushEndTime && state.goldRushEndTime > Date.now()) {
+    const remaining = state.goldRushEndTime - Date.now();
+    console.log('[GOLDRUSH] restoring with %dms remaining', remaining);
+    activateGoldRush(remaining);
+  }
 
   // Offline earnings
   const offlineCoins = calcOfflineEarnings();
